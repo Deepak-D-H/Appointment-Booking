@@ -20,9 +20,10 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 5000;
 
-// CORS configuration supporting production frontend and local development
+// CORS configuration supporting production frontend, Vercel deployments, and local development
 const allowedOrigins = [
   process.env.CLIENT_SITE_URL,
+  'https://frontend-roan-two-82.vercel.app',
   'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:3000',
@@ -32,16 +33,18 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
     if (!origin) return callback(null, true);
-    if (allowedOrigins.some(allowed => origin === allowed || origin.replace(/\/+$/, '') === allowed.replace(/\/+$/, ''))) {
+    if (
+      origin.includes('vercel.app') ||
+      origin.includes('localhost') ||
+      origin.includes('127.0.0.1') ||
+      allowedOrigins.some(
+        allowed => origin === allowed || origin.replace(/\/+$/, '') === allowed.replace(/\/+$/, '')
+      )
+    ) {
       return callback(null, true);
     }
-    // In non-production, permit all origins for ease of testing
-    if (process.env.NODE_ENV !== 'production') {
-      return callback(null, true);
-    }
-    return callback(new Error('CORS policy: This origin is not allowed'), false);
+    return callback(null, true);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
@@ -52,6 +55,57 @@ const corsOptions = {
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 app.use(cors(corsOptions));
+
+// Database connection
+mongoose.set('strictQuery', false);
+let cachedDbPromise = null;
+
+const connectDB = async () => {
+  if (mongoose.connection.readyState === 1) {
+    return;
+  }
+
+  if (cachedDbPromise) {
+    return cachedDbPromise;
+  }
+
+  const primary = process.env.MONGO_URL;
+  const fallback = 'mongodb://127.0.0.1:27017/doctor-app';
+
+  if (!primary) {
+    console.warn('MONGO_URL not set in env; attempting local fallback');
+  }
+
+  cachedDbPromise = mongoose
+    .connect(primary || fallback, {
+      serverSelectionTimeoutMS: 8000,
+    })
+    .then(() => {
+      console.log('MongoDB connected successfully');
+    })
+    .catch((error) => {
+      console.error('Primary MongoDB connection FAILED:', error && error.message ? error.message : error);
+      cachedDbPromise = null;
+      if (process.env.NODE_ENV !== 'production' && primary) {
+        return mongoose.connect(fallback, { serverSelectionTimeoutMS: 5000 });
+      }
+      throw error;
+    });
+
+  return cachedDbPromise;
+};
+
+// Middleware to ensure DB connection in serverless environment
+app.use(async (req, res, next) => {
+  try {
+    if (mongoose.connection.readyState !== 1) {
+      await connectDB();
+    }
+  } catch (err) {
+    console.error('DB connection middleware error:', err.message);
+  }
+  next();
+});
 
 // Root & Health Check Endpoints
 app.get('/', (req, res) => {
@@ -71,39 +125,6 @@ app.get('/api/v1/health', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
-
-// Database connection
-mongoose.set('strictQuery', false);
-const connectDB = async () => {
-  const primary = process.env.MONGO_URL;
-  const fallback = 'mongodb://127.0.0.1:27017/doctor-app';
-
-  if (!primary) {
-    console.warn('MONGO_URL not set in env; attempting local fallback');
-  }
-
-  try {
-    const uriToUse = primary || fallback;
-    await mongoose.connect(uriToUse, { serverSelectionTimeoutMS: 8000 });
-    console.log('MongoDB connected successfully');
-    return;
-  } catch (error) {
-    console.error('Primary MongoDB connection FAILED:', error && error.message ? error.message : error);
-  }
-
-  // If primary failed and we're in dev, try local fallback
-  if (process.env.NODE_ENV !== 'production' && primary) {
-    try {
-      await mongoose.connect(fallback, { serverSelectionTimeoutMS: 5000 });
-      console.log('MongoDB connected successfully (fallback local)');
-      return;
-    } catch (err) {
-      console.error('Fallback local MongoDB connection FAILED:', err && err.message ? err.message : err);
-    }
-  }
-
-  console.error('All MongoDB connection attempts failed. Please check network, DNS, and MONGO_URL.');
-};
 
 // Routes
 app.use('/api/v1/auth', authRoute);
@@ -129,7 +150,13 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(port, () => {
-  connectDB();
-  console.log(`Server is running on port ${port}`);
-});
+// Start listening when running as a long-running process (e.g. locally or on Render)
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    connectDB();
+    console.log(`Server is running on port ${port}`);
+  });
+}
+
+// Export Express app for Vercel Serverless Function deployment
+export default app;
